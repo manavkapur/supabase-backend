@@ -19,8 +19,8 @@ Deno.serve(async (req) => {
     // 🔐 1. Verify user manually
     // -----------------------------
     const authHeader =
-  req.headers.get("authorization") ||
-  req.headers.get("Authorization");
+      req.headers.get("authorization") ||
+      req.headers.get("Authorization");
 
     if (!authHeader) {
       return new Response(JSON.stringify({ error: "Missing Authorization" }), {
@@ -106,15 +106,49 @@ Deno.serve(async (req) => {
       .select()
       .single();
 
-    if (orderError) {
-  console.error("ORDER ERROR", orderError);
-  throw new Error(orderError.message);
-}
+    if (orderError || !orders) {
+      console.error("ORDER ERROR:", orderError);
+      throw new Error("Failed to create order");
+    }
 
     const order = orders;
 
     // -----------------------------
-    // 💰 6. Create Razorpay order
+    // 📸 6. Snapshot cart → order_items
+    // -----------------------------
+    const orderItems = items.map((i: any) => ({
+      order_id: order.id,
+      product_id: i.products.id,
+      product_name: i.products.name,
+      price: i.products.price,
+      qty: i.quantity,
+      item_total: i.quantity * i.products.price,
+    }));
+
+    const { error: orderItemsError } = await supabase
+      .from("order_items")
+      .insert(orderItems);
+
+    if (orderItemsError) {
+      console.error("ORDER ITEMS ERROR:", orderItemsError);
+      throw new Error("Failed to snapshot order items");
+    }
+
+    // -----------------------------
+    // 🔒 7. Lock the cart
+    // -----------------------------
+    const { error: cartLockError } = await supabase
+      .from("carts")
+      .update({ status: "CONVERTED" })
+      .eq("id", cartId);
+
+    if (cartLockError) {
+      console.error("CART LOCK ERROR:", cartLockError);
+      throw new Error("Failed to lock cart");
+    }
+
+    // -----------------------------
+    // 💰 8. Create Razorpay order
     // -----------------------------
     const razorpayRes = await fetch("https://api.razorpay.com/v1/orders", {
       method: "POST",
@@ -138,21 +172,27 @@ Deno.serve(async (req) => {
     const razorpayOrder = await razorpayRes.json();
 
     if (!razorpayRes.ok) {
+      console.error("RAZORPAY ERROR:", razorpayOrder);
       throw new Error("Razorpay order creation failed");
     }
 
     // -----------------------------
-    // 🧾 7. Save payment row
+    // 🧾 9. Save payment row
     // -----------------------------
-    await supabase.from("payments").insert({
+    const { error: paymentError } = await supabase.from("payments").insert({
       order_id: order.id,
       razorpay_order_id: razorpayOrder.id,
       amount: subTotal,
       status: "CREATED",
     });
 
+    if (paymentError) {
+      console.error("PAYMENT INSERT ERROR:", paymentError);
+      throw new Error("Failed to create payment row");
+    }
+
     // -----------------------------
-    // ✅ 8. Return to app
+    // ✅ 10. Return to app
     // -----------------------------
     return new Response(
       JSON.stringify({
@@ -166,7 +206,7 @@ Deno.serve(async (req) => {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       }
     );
-  } catch (e) {
+  } catch (e: any) {
     return new Response(JSON.stringify({ error: String(e.message || e) }), {
       status: 400,
       headers: corsHeaders,
