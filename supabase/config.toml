@@ -396,7 +396,7 @@ entrypoint = "./functions/create-order/index.ts"
 
 [functions.verify-payment]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/verify-payment/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
