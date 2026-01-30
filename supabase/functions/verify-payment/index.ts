@@ -12,7 +12,7 @@ async function verifySignature(
   orderId: string,
   paymentId: string,
   signature: string,
-  secret: string
+  secret: string,
 ) {
   const payload = `${orderId}|${paymentId}`;
 
@@ -21,13 +21,13 @@ async function verifySignature(
     new TextEncoder().encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
-    ["sign"]
+    ["sign"],
   );
 
   const signed = await crypto.subtle.sign(
     "HMAC",
     key,
-    new TextEncoder().encode(payload)
+    new TextEncoder().encode(payload),
   );
 
   const expected = Array.from(new Uint8Array(signed))
@@ -61,7 +61,7 @@ Deno.serve(async (req) => {
     // ----------------------------------
     const supabase = createClient(
       Deno.env.get("SB_URL")!,
-      Deno.env.get("SB_SERVICE_ROLE_KEY")!
+      Deno.env.get("SB_SERVICE_ROLE_KEY")!,
     );
 
     // ----------------------------------
@@ -81,13 +81,25 @@ Deno.serve(async (req) => {
     // 🔁 IDEMPOTENCY CHECK #1
     // ----------------------------------
     if (payment.status === "PAID") {
+      // Ensure order is also updated (self-healing)
+      await supabase
+        .from("orders")
+        .update({
+          payment_id: razorpay_payment_id,
+          payment_signature: razorpay_signature,
+          payment_status: "PAID",
+          status: "PAID",
+        })
+        .eq("id", payment.order_id)
+        .neq("payment_status", "PAID");
+
       return new Response(
         JSON.stringify({
           success: true,
           order_id: payment.order_id,
-          message: "Payment already verified",
+          message: "Payment already verified (order healed)",
         }),
-        { headers: corsHeaders }
+        { headers: corsHeaders },
       );
     }
 
@@ -106,7 +118,7 @@ Deno.serve(async (req) => {
           order_id: payment.order_id,
           message: "Order already confirmed",
         }),
-        { headers: corsHeaders }
+        { headers: corsHeaders },
       );
     }
 
@@ -117,7 +129,7 @@ Deno.serve(async (req) => {
       razorpay_order_id,
       razorpay_payment_id,
       razorpay_signature,
-      Deno.env.get("RAZORPAY_KEY_SECRET")!
+      Deno.env.get("RAZORPAY_KEY_SECRET")!,
     );
 
     if (!valid) {
@@ -154,7 +166,7 @@ Deno.serve(async (req) => {
         payment_id: razorpay_payment_id,
         payment_signature: razorpay_signature,
         payment_status: "PAID",
-        status: "CONFIRMED",
+        status: "PAID",
       })
       .eq("id", payment.order_id)
       .neq("payment_status", "PAID"); // ⬅️ critical idempotency guard
@@ -171,12 +183,12 @@ Deno.serve(async (req) => {
         success: true,
         order_id: payment.order_id,
       }),
-      { headers: corsHeaders }
+      { headers: corsHeaders },
     );
   } catch (e: any) {
     return new Response(
       JSON.stringify({ error: e.message || String(e) }),
-      { status: 400, headers: corsHeaders }
+      { status: 400, headers: corsHeaders },
     );
   }
 });
