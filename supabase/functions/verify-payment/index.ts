@@ -1,6 +1,5 @@
 // Setup type definitions for Supabase Edge Runtime
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const corsHeaders = {
@@ -44,49 +43,76 @@ Deno.serve(async (req) => {
   }
 
   try {
-    // -----------------------------
+    // ----------------------------------
     // 1. Parse body
-    // -----------------------------
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
-      await req.json();
+    // ----------------------------------
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    } = await req.json();
 
-    if (
-      !razorpay_order_id ||
-      !razorpay_payment_id ||
-      !razorpay_signature
-    ) {
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       throw new Error("Missing payment verification fields");
     }
 
-    // -----------------------------
+    // ----------------------------------
     // 2. Init Supabase (service role)
-    // -----------------------------
+    // ----------------------------------
     const supabase = createClient(
       Deno.env.get("SB_URL")!,
       Deno.env.get("SB_SERVICE_ROLE_KEY")!
     );
 
-    // -----------------------------
-    // 3. Fetch payment row
-    // -----------------------------
-    const { data: payment, error: payErr } = await supabase
+    // ----------------------------------
+    // 3. Fetch payment + order
+    // ----------------------------------
+    const { data: payment, error } = await supabase
       .from("payments")
-      .select("*, orders(*)")
+      .select("id, status, order_id, orders(id, status, payment_status)")
       .eq("razorpay_order_id", razorpay_order_id)
       .single();
 
-    if (payErr || !payment) throw new Error("Payment record not found");
+    if (error || !payment) {
+      throw new Error("Payment record not found");
+    }
 
+    // ----------------------------------
+    // 🔁 IDEMPOTENCY CHECK #1
+    // ----------------------------------
     if (payment.status === "PAID") {
       return new Response(
-        JSON.stringify({ success: true, message: "Already verified" }),
+        JSON.stringify({
+          success: true,
+          order_id: payment.order_id,
+          message: "Payment already verified",
+        }),
         { headers: corsHeaders }
       );
     }
 
-    // -----------------------------
+    // ----------------------------------
+    // 🔁 IDEMPOTENCY CHECK #2
+    // ----------------------------------
+    if (payment.orders?.payment_status === "PAID") {
+      await supabase
+        .from("payments")
+        .update({ status: "PAID" })
+        .eq("id", payment.id);
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          order_id: payment.order_id,
+          message: "Order already confirmed",
+        }),
+        { headers: corsHeaders }
+      );
+    }
+
+    // ----------------------------------
     // 4. Verify Razorpay signature
-    // -----------------------------
+    // ----------------------------------
     const valid = await verifySignature(
       razorpay_order_id,
       razorpay_payment_id,
@@ -94,33 +120,52 @@ Deno.serve(async (req) => {
       Deno.env.get("RAZORPAY_KEY_SECRET")!
     );
 
-    if (!valid) throw new Error("Invalid Razorpay signature");
+    if (!valid) {
+      throw new Error("Invalid Razorpay signature");
+    }
 
-    // -----------------------------
-    // 5. Update payment row
-    // -----------------------------
-    await supabase
+    // ----------------------------------
+    // 5. Update payment (guarded)
+    // ----------------------------------
+    const { error: payUpdateError } = await supabase
       .from("payments")
       .update({
         razorpay_payment_id,
         status: "PAID",
+        raw_payload: {
+          razorpay_order_id,
+          razorpay_payment_id,
+          razorpay_signature,
+        },
       })
-      .eq("id", payment.id);
+      .eq("id", payment.id)
+      .neq("status", "PAID"); // ⬅️ critical idempotency guard
 
-    // -----------------------------
-    // 6. Update order row
-    // -----------------------------
-    await supabase
+    if (payUpdateError) {
+      throw new Error("Failed to update payment");
+    }
+
+    // ----------------------------------
+    // 6. Update order (guarded)
+    // ----------------------------------
+    const { error: orderUpdateError } = await supabase
       .from("orders")
       .update({
+        payment_id: razorpay_payment_id,
+        payment_signature: razorpay_signature,
         payment_status: "PAID",
         status: "CONFIRMED",
       })
-      .eq("id", payment.order_id);
+      .eq("id", payment.order_id)
+      .neq("payment_status", "PAID"); // ⬅️ critical idempotency guard
 
-    // -----------------------------
+    if (orderUpdateError) {
+      throw new Error("Failed to update order");
+    }
+
+    // ----------------------------------
     // ✅ 7. Done
-    // -----------------------------
+    // ----------------------------------
     return new Response(
       JSON.stringify({
         success: true,

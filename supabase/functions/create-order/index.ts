@@ -1,6 +1,5 @@
 // Setup type definitions for Supabase Edge Runtime
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const corsHeaders = {
@@ -15,9 +14,9 @@ Deno.serve(async (req) => {
   }
 
   try {
-    // -----------------------------
-    // 🔐 1. Verify user manually
-    // -----------------------------
+    // --------------------------------------------------
+    // 🔐 1. Read Authorization header
+    // --------------------------------------------------
     const authHeader =
       req.headers.get("authorization") ||
       req.headers.get("Authorization");
@@ -29,20 +28,21 @@ Deno.serve(async (req) => {
       });
     }
 
-    const supabase = createClient(
+    // --------------------------------------------------
+    // 👤 2. USER client (RLS enforced)
+    // --------------------------------------------------
+    const userSupabase = createClient(
       Deno.env.get("SB_URL")!,
-      Deno.env.get("SB_SERVICE_ROLE_KEY")!,
+      Deno.env.get("SB_ANON_KEY")!,
       {
-        global: {
-          headers: { Authorization: authHeader },
-        },
+        global: { headers: { Authorization: authHeader } },
       }
     );
 
     const {
       data: { user },
       error: userError,
-    } = await supabase.auth.getUser();
+    } = await userSupabase.auth.getUser();
 
     if (userError || !user) {
       return new Response(JSON.stringify({ error: "Invalid user" }), {
@@ -53,69 +53,94 @@ Deno.serve(async (req) => {
 
     const userId = user.id;
 
-    // -----------------------------
-    // 🛒 2. Get active cart
-    // -----------------------------
-    const { data: carts, error: cartError } = await supabase
+    // --------------------------------------------------
+    // 🔑 3. ADMIN client (bypasses RLS)
+    // --------------------------------------------------
+    const adminSupabase = createClient(
+      Deno.env.get("SB_URL")!,
+      Deno.env.get("SB_SERVICE_ROLE_KEY")!
+    );
+
+    // --------------------------------------------------
+    // 🛒 4. Fetch active cart
+    // --------------------------------------------------
+    const { data: cart } = await userSupabase
       .from("carts")
       .select("id")
       .eq("user_id", userId)
       .eq("status", "ACTIVE")
-      .limit(1);
+      .maybeSingle();
 
-    if (cartError || !carts || carts.length === 0) {
-      throw new Error("No active cart found");
-    }
+    if (!cart) throw new Error("No active cart found");
 
-    const cartId = carts[0].id;
-
-    // -----------------------------
-    // 📦 3. Get cart items
-    // -----------------------------
-    const { data: items, error: itemsError } = await supabase
+    // --------------------------------------------------
+    // 📦 5. Fetch cart items
+    // --------------------------------------------------
+    const { data: items } = await userSupabase
       .from("cart_items")
       .select("quantity, products ( id, name, price )")
-      .eq("cart_id", cartId);
+      .eq("cart_id", cart.id);
 
-    if (itemsError || !items || items.length === 0) {
+    if (!items || items.length === 0) {
       throw new Error("Cart is empty");
     }
 
-    // -----------------------------
-    // 🧮 4. Calculate totals
-    // -----------------------------
+    // --------------------------------------------------
+    // 🧮 6. Calculate totals (₹ → paise)
+    // --------------------------------------------------
     let subTotal = 0;
-
-    items.forEach((i: any) => {
+    for (const i of items) {
       subTotal += i.quantity * i.products.price;
-    });
+    }
 
-    // -----------------------------
-    // 📦 5. Create order in DB
-    // -----------------------------
-    const { data: orders, error: orderError } = await supabase
+    const amountPaise = Math.round(subTotal * 100);
+
+    // --------------------------------------------------
+    // 🔁 7. Idempotency (existing CREATED order)
+    // --------------------------------------------------
+    const { data: existingOrder } = await adminSupabase
+      .from("orders")
+      .select("id, payment_gateway_order_id")
+      .eq("user_id", userId)
+      .eq("status", "CREATED")
+      .maybeSingle();
+
+    if (existingOrder?.payment_gateway_order_id) {
+      return new Response(
+        JSON.stringify({
+          order_id: existingOrder.id,
+          razorpay_order_id: existingOrder.payment_gateway_order_id,
+          amount: amountPaise,
+          currency: "INR",
+          key: Deno.env.get("RAZORPAY_KEY_ID"),
+        }),
+        { headers: corsHeaders }
+      );
+    }
+
+    // --------------------------------------------------
+    // 📦 8. Create order (ADMIN)
+    // --------------------------------------------------
+    const { data: order, error: orderError } = await adminSupabase
       .from("orders")
       .insert({
         user_id: userId,
         sub_total: subTotal,
         discount_total: 0,
         grand_total: subTotal,
-        status: "CREATED",
         payment_status: "CREATED",
+        status: "CREATED",
       })
       .select()
       .single();
 
-    if (orderError || !orders) {
-      console.error("ORDER ERROR:", orderError);
+    if (orderError || !order) {
       throw new Error("Failed to create order");
     }
 
-    const order = orders;
-
-    // -----------------------------
-    // 📸 6. Snapshot cart → order_items
-    // -----------------------------
+    // --------------------------------------------------
+    // 📸 9. Snapshot order_items (ADMIN)
+    // --------------------------------------------------
     const orderItems = items.map((i: any) => ({
       order_id: order.id,
       product_id: i.products.id,
@@ -125,31 +150,11 @@ Deno.serve(async (req) => {
       item_total: i.quantity * i.products.price,
     }));
 
-    const { error: orderItemsError } = await supabase
-      .from("order_items")
-      .insert(orderItems);
+    await adminSupabase.from("order_items").insert(orderItems);
 
-    if (orderItemsError) {
-      console.error("ORDER ITEMS ERROR:", orderItemsError);
-      throw new Error("Failed to snapshot order items");
-    }
-
-    // -----------------------------
-    // 🔒 7. Lock the cart
-    // -----------------------------
-    const { error: cartLockError } = await supabase
-      .from("carts")
-      .update({ status: "CONVERTED" })
-      .eq("id", cartId);
-
-    if (cartLockError) {
-      console.error("CART LOCK ERROR:", cartLockError);
-      throw new Error("Failed to lock cart");
-    }
-
-    // -----------------------------
-    // 💰 8. Create Razorpay order
-    // -----------------------------
+    // --------------------------------------------------
+    // 💰 10. Create Razorpay order
+    // --------------------------------------------------
     const razorpayRes = await fetch("https://api.razorpay.com/v1/orders", {
       method: "POST",
       headers: {
@@ -163,7 +168,7 @@ Deno.serve(async (req) => {
           ),
       },
       body: JSON.stringify({
-        amount: subTotal, // paise
+        amount: amountPaise,
         currency: "INR",
         receipt: `order_${order.id}`,
       }),
@@ -172,42 +177,53 @@ Deno.serve(async (req) => {
     const razorpayOrder = await razorpayRes.json();
 
     if (!razorpayRes.ok) {
-      console.error("RAZORPAY ERROR:", razorpayOrder);
       throw new Error("Razorpay order creation failed");
     }
 
-    // -----------------------------
-    // 🧾 9. Save payment row
-    // -----------------------------
-    const { error: paymentError } = await supabase.from("payments").insert({
+    // --------------------------------------------------
+    // 🧾 11. Create payment row (ADMIN) ✅ FIX
+    // --------------------------------------------------
+    await adminSupabase.from("payments").insert({
       order_id: order.id,
       razorpay_order_id: razorpayOrder.id,
-      amount: subTotal,
+      amount: amountPaise,
       status: "CREATED",
+      raw_payload: razorpayOrder,
     });
 
-    if (paymentError) {
-      console.error("PAYMENT INSERT ERROR:", paymentError);
-      throw new Error("Failed to create payment row");
-    }
+    // --------------------------------------------------
+    // 🔗 12. Update order with gateway order id
+    // --------------------------------------------------
+    await adminSupabase
+      .from("orders")
+      .update({
+        payment_gateway_order_id: razorpayOrder.id,
+      })
+      .eq("id", order.id);
 
-    // -----------------------------
-    // ✅ 10. Return to app
-    // -----------------------------
+    // --------------------------------------------------
+    // 🔒 13. Lock cart
+    // --------------------------------------------------
+    await adminSupabase
+      .from("carts")
+      .update({ status: "CONVERTED" })
+      .eq("id", cart.id);
+
+    // --------------------------------------------------
+    // ✅ 14. Return response
+    // --------------------------------------------------
     return new Response(
       JSON.stringify({
         order_id: order.id,
         razorpay_order_id: razorpayOrder.id,
-        amount: subTotal,
+        amount: amountPaise,
         currency: "INR",
         key: Deno.env.get("RAZORPAY_KEY_ID"),
       }),
-      {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
+      { headers: corsHeaders }
     );
   } catch (e: any) {
-    return new Response(JSON.stringify({ error: String(e.message || e) }), {
+    return new Response(JSON.stringify({ error: e.message || String(e) }), {
       status: 400,
       headers: corsHeaders,
     });
